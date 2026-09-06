@@ -161,6 +161,9 @@ function createUnauthenticatedClient() {
 
 const BOOLEAN_FLAGS = new Set([
   'active',
+  'plain',
+  'no-stream',
+  'hidden',
   'active-only',
   'debug',
   'escrow',
@@ -437,6 +440,20 @@ ${colors.cyan}Commands:${colors.reset}
     connect status <id>   Check Stripe account status
     escrow release <id>   Release card escrow funds
     escrow refund <id>    Refund card escrow
+
+  ${colors.bright}finances${colors.reset}       (also: coinpay money)
+    [tui]                 Live dashboard: earnings, commission, refunds,
+                            bank & credit-card feeds, ledger, invoices, escrow
+      --days <n>          Window for earnings/cashflow (7, 30, 90, 365; default 30)
+      --interval <s>      Refresh every s seconds (default 30)
+      --business-id <id>  Narrow payments to one business
+    summary               Plain-text headline numbers (--json for machines)
+    position              Debt vs income, credits vs debits, recurring bills
+                            (also: coinpay finances debt)
+    accounts              Linked bank and card accounts with balances
+    ledger                Bank/card transactions (--limit, --search, --category, --account)
+    connections           Linked institutions and their last sync
+    sync                  Pull fresh balances from the bank bridge (--days)
 
   ${colors.bright}escrow${colors.reset}
     create                Create a new escrow
@@ -3447,6 +3464,7 @@ const MENU_COMMANDS = [
   ['logout', 'Sign out on this device'],
   ['config', 'API key & endpoint (set-key, set-url, show)'],
   ['auth', 'Merchant account (register, login, me)'],
+  ['finances', 'Live money dashboard (earnings, cards, bank feeds, ledger)'],
   ['payment', 'Payments (create, get, list, qr)'],
   ['invoice', 'Invoices (create, list, get, update, publish, send, delete)'],
   ['tokens', 'List checkout tokens'],
@@ -3468,6 +3486,7 @@ const MENU_COMMANDS = [
 const SUBCOMMANDS = {
   config: [['set-key', 'Set your API key'], ['set-url', 'Set custom API URL'], ['show', 'Show current configuration']],
   auth: [['register', 'Register new merchant account'], ['login', 'Login to merchant account'], ['me', 'Show current merchant info']],
+  finances: [['tui', 'Live dashboard (default)'], ['summary', 'Headline numbers as text'], ['position', 'Debt vs income, credits vs debits'], ['accounts', 'Bank & card accounts'], ['ledger', 'Bank/card transactions'], ['connections', 'Linked institutions'], ['sync', 'Pull fresh bank data']],
   payment: [['create', 'Create a new payment'], ['get', 'Get payment details <id>'], ['list', 'List payments'], ['qr', 'Get payment QR code <id>']],
   invoice: [['create', 'Create a draft invoice'], ['list', 'List invoices'], ['get', 'Get invoice details <id>'], ['update', 'Update a draft invoice <id>'], ['publish', 'Publish an invoice <id>'], ['send', 'Send an invoice <id>'], ['delete', 'Delete a draft invoice <id>']],
   tokens: [['list', 'List checkout tokens']],
@@ -3815,6 +3834,341 @@ async function handleWhoami(flags) {
   if (flags?.json) print.json(me);
 }
 
+
+/**
+ * Finances — the merchant's money in one place (bank feeds via SimpleFIN or
+ * Plaid, crypto and card earnings, commission paid, refunds, invoices, escrow).
+ *
+ * Needs the merchant session from `coinpay login`; the bank-data routes
+ * refuse business API keys on purpose.
+ */
+function financesClient() {
+  const cfg = loadConfig();
+  const token = process.env.COINPAY_SESSION_TOKEN || cfg.jwtToken;
+  if (!token) {
+    print.error('Finances need your merchant session, not an API key. Run: coinpay login');
+    process.exit(1);
+  }
+  return { client: new CoinPayClient({ apiKey: token, baseUrl: getBaseUrl(), timeout: 120000 }), token, baseUrl: getBaseUrl() };
+}
+
+function pad(value, width, align = 'left') {
+  const s = String(value ?? '');
+  if (s.length >= width) return s;
+  return align === 'right' ? s.padStart(width) : s.padEnd(width);
+}
+
+function printTable(rows, columns) {
+  if (!rows.length) return;
+  const widths = columns.map((c) => Math.max(c.title.length, ...rows.map((r) => String(c.render(r) ?? '').length)));
+  console.log(colors.bright + columns.map((c, i) => pad(c.title, widths[i], c.align)).join('  ') + colors.reset);
+  for (const r of rows) {
+    console.log(columns.map((c, i) => pad(c.render(r) ?? '', widths[i], c.align)).join('  '));
+  }
+}
+
+function printFinanceSummary(snapshot, fmt) {
+  const { money, ago } = fmt;
+  const e = snapshot.earnings;
+  const b = snapshot.bank;
+  const cur = b.currency || 'USD';
+  const win = `${snapshot.windowDays}d`;
+  const line = (label, value, color = '') => console.log(`  ${pad(label, 26)} ${color}${value}${colors.reset}`);
+
+  console.log(`\n${colors.bright}Earnings · ${win}${colors.reset}${snapshot.plan ? colors.cyan + '  (' + snapshot.plan.commission_percent + ' plan)' + colors.reset : ''}`);
+  line('Gross volume', money(e.grossVolumeUsd), colors.bright);
+  line('  crypto', money(e.cryptoVolumeUsd));
+  line('  cards', money(e.cardVolumeUsd));
+  line('Commission paid', `-${money(e.commissionUsd)}`, colors.yellow);
+  line('Card processor fees', `-${money(e.stripeFeesUsd)}`, colors.yellow);
+  line('Refunds', `-${money(e.refundsUsd)}`, e.refundsUsd > 0 ? colors.red : '');
+  line('Net earnings', money(e.netUsd), e.netUsd >= 0 ? colors.green : colors.red);
+  line('Paid transactions', `${e.transactions} (${e.failed} failed, ${e.failureRate}%)`);
+
+  console.log(`\n${colors.bright}Bank & cards${colors.reset}`);
+  if (!b.connections.length) {
+    console.log('  Nothing linked. Connect a bank at ' + new URL('/finances', getBaseUrl()).toString());
+  } else {
+    line('Cash & assets', money(b.assets, cur), colors.green);
+    line('Cards & loans owed', money(b.liabilities, cur), colors.red);
+    line('Net position', money(b.net, cur), b.net >= 0 ? colors.green : colors.red);
+    line(`Cash in · ${win}`, money(b.cashflow.moneyIn, cur), colors.green);
+    line(`Cash out · ${win}`, money(b.cashflow.moneyOut, cur), colors.red);
+    line('Cashflow net', money(b.cashflow.net, cur), b.cashflow.net >= 0 ? colors.green : colors.red);
+    line('Accounts', `${b.accountCount} (${b.creditCards.length} credit cards)`);
+    line('Last bank sync', `${ago(b.connections[0]?.last_synced_at)} · ${b.connections[0]?.last_sync_status || '—'}`);
+  }
+
+  console.log(`\n${colors.bright}Pipeline${colors.reset}`);
+  const inv = snapshot.invoices;
+  const esc = snapshot.escrow;
+  line('Invoices outstanding', `${money(inv.totals.outstanding)} (${inv.counts.outstanding})`, colors.yellow);
+  line('Invoices overdue', `${money(inv.totals.overdue)} (${inv.counts.overdue})`, inv.counts.overdue ? colors.red : '');
+  line(`Invoices paid · ${win}`, `${money(inv.totals.paid)} (${inv.counts.paid})`, colors.green);
+  line('Escrow held', `${money(esc.heldUsd)} (${esc.held})`, colors.cyan);
+  line(`Escrow released · ${win}`, `${money(esc.releasedUsd)} (${esc.released})`);
+  line(`Escrow refunded · ${win}`, `${money(esc.refundedUsd)} (${esc.refunded})`, esc.refunded ? colors.red : '');
+  line('Card payouts pending', money(snapshot.payout.pendingUsd));
+  line(`Card payouts paid · ${win}`, money(snapshot.payout.paidUsd), colors.green);
+
+  if (snapshot.position) printPosition(snapshot.position, fmt, { heading: true });
+
+  const failed = Object.keys(snapshot.errors);
+  if (failed.length) {
+    console.log('');
+    print.warn(`Unavailable: ${failed.map((k) => `${k} (${snapshot.errors[k]})`).join('; ')}`);
+  }
+  console.log('');
+}
+
+/**
+ * Debt against income as text.
+ *
+ * Shared by `finances summary` (as one more section) and `finances position`
+ * (on its own, with the account and recurring detail the summary omits).
+ */
+function printPosition(position, fmt, { heading = false, detail = false } = {}) {
+  const { money, pct } = fmt;
+  const cur = position.currency || 'USD';
+  const look = `${Math.round(position.observedDays ?? position.lookbackDays)}d`;
+  const line = (label, value, color = '') => console.log(`  ${pad(label, 26)} ${color}${value}${colors.reset}`);
+
+  if (heading) console.log(`\n${colors.bright}Debt & income · ${look}${colors.reset}${colors.cyan}  (${position.monthsObserved} months)${colors.reset}`);
+
+  const inc = position.income;
+  const spend = position.spending;
+  const debt = position.debt;
+  const r = position.ratios;
+
+  line('Income', `${money(inc.total, cur)}  (${money(inc.perMonth, cur)}/mo)`, colors.green);
+  line('Spending', `${money(spend.total, cur)}  (${money(spend.perMonth, cur)}/mo)`, colors.red);
+  line('Net', `${money(position.net.total, cur)}  (${money(position.net.perMonth, cur)}/mo)`, position.net.total >= 0 ? colors.green : colors.red);
+  line('Kept of income', pct(position.net.savingsRate, 1));
+  line('Gross credits / debits', `${money(inc.grossCredits, cur)} / ${money(spend.grossDebits, cur)}`);
+  line('Total owed', money(debt.total, cur), colors.red);
+  line('  revolving / instalment', `${money(debt.revolving, cur)} / ${money(debt.instalment, cur)}`);
+  line('Debt paid per month', money(debt.servicePerMonth, cur), colors.green);
+  line('Fixed bills per month', money(position.recurring.monthlyTotal, cur), colors.yellow);
+  line('Clear in', debt.payoffMonths === null ? 'never at this rate' : `${debt.payoffMonths} months (${debt.payoffDate ? debt.payoffDate.slice(0, 10) : '—'})`, debt.payoffMonths === null ? colors.red : '');
+  line('Debt to income', r.debtToIncome === null ? '—' : `${r.debtToIncome.toFixed(2)}x`, (r.debtToIncome ?? 0) > 1 ? colors.red : colors.green);
+  line('Debt service ratio', pct(r.debtServiceRatio, 1), (r.debtServiceRatio ?? 0) > 0.36 ? colors.red : colors.green);
+  line('Months of cover', r.monthsOfCover === null ? '—' : r.monthsOfCover.toFixed(1));
+  line('Card utilisation', pct(r.creditUtilisation, 0));
+
+  for (const sc of position.scopes) {
+    line(`${sc.scope} (${sc.accounts} acct)`, `${money(sc.income, cur)} in · ${money(sc.spending, cur)} out · owes ${money(sc.debt, cur)}`);
+  }
+
+  if (position.confidence.noLiabilityAccounts) {
+    console.log('');
+    print.warn('No card or loan account is linked, so the debt figures are blind.');
+  }
+  if (position.confidence.uncategorisedShare > 0.25) {
+    console.log('');
+    print.warn(`${pct(position.confidence.uncategorisedShare, 0)} of transactions are uncategorised — the income/spending split is rough.`);
+  }
+
+  if (!detail) return;
+
+  if (position.months.length) {
+    console.log(`\n${colors.bright}Month by month${colors.reset}`);
+    printTable(position.months, [
+      { title: 'Month', align: 'left', render: (m) => (m.partial ? `${m.month} *` : m.month) },
+      { title: 'Income', align: 'right', render: (m) => money(m.income, cur) },
+      { title: 'Spending', align: 'right', render: (m) => money(m.spending, cur) },
+      { title: 'Net', align: 'right', render: (m) => money(m.net, cur) },
+      { title: 'Debt paid', align: 'right', render: (m) => money(m.debtService, cur) },
+      { title: 'Rows', align: 'right', render: (m) => String(m.transactions) },
+    ]);
+    console.log(`  ${colors.cyan}* partial month${colors.reset}`);
+  }
+
+  if (debt.accounts.length) {
+    console.log(`\n${colors.bright}Owed by account${colors.reset}`);
+    printTable(debt.accounts, [
+      { title: 'Institution', align: 'left', render: (d) => d.org || '—' },
+      { title: 'Account', align: 'left', render: (d) => d.name },
+      { title: 'Kind', align: 'left', render: (d) => d.kind },
+      { title: 'Side', align: 'left', render: (d) => d.scope },
+      { title: 'Owed', align: 'right', render: (d) => money(d.owed, cur) },
+      { title: 'Share', align: 'right', render: (d) => pct(d.share, 0) },
+      { title: `Paid ${look}`, align: 'right', render: (d) => money(d.paid, cur) },
+      { title: 'Clear in', align: 'right', render: (d) => (d.payoffMonths === null ? 'never' : `${d.payoffMonths} mo`) },
+    ]);
+  }
+
+  if (position.recurring.charges.length) {
+    console.log(`\n${colors.bright}Recurring${colors.reset}  ${colors.cyan}${money(position.recurring.monthlyTotal, cur)}/mo, of which ${money(position.recurring.monthlyDebtService, cur)} is debt${colors.reset}`);
+    printTable(position.recurring.charges, [
+      { title: 'Payee', align: 'left', render: (c) => c.payee },
+      { title: 'Amount', align: 'right', render: (c) => money(c.amount, cur) },
+      { title: 'Every', align: 'left', render: (c) => c.cadence },
+      { title: 'Seen', align: 'right', render: (c) => String(c.occurrences) },
+      { title: 'Last', align: 'left', render: (c) => c.lastSeen.slice(0, 10) },
+      { title: 'Next', align: 'left', render: (c) => c.nextExpected.slice(0, 10) },
+      { title: 'Per month', align: 'right', render: (c) => money(c.monthlyEquivalent, cur) },
+      { title: 'Kind', align: 'left', render: (c) => (c.isDebtService ? 'debt' : 'bill') },
+    ]);
+  }
+  console.log('');
+}
+
+async function handleFinances(subcommand, args, flags) {
+  const parsedDays = Number.parseInt(String(flags.days ?? flags.window ?? ''), 10);
+  const days = Number.isFinite(parsedDays) && parsedDays > 0 ? parsedDays : 30;
+  const fin = await import('../src/finances.js');
+
+  switch (subcommand || 'tui') {
+    case 'tui':
+    case 'dashboard':
+    case 'watch': {
+      const { client, token, baseUrl } = financesClient();
+      const wantsText = flags.plain || flags.json || !process.stdout.isTTY || !process.stdin.isTTY;
+      if (wantsText) {
+        const snapshot = await fin.collectFinanceSnapshot(client, { days, businessId: flags['business-id'] });
+        if (flags.json) { print.json(snapshot); return; }
+        const fmt = await import('../src/finances-tui.js');
+        printFinanceSummary(snapshot, fmt);
+        return;
+      }
+      const parsedInterval = Number.parseInt(String(flags.interval ?? ''), 10);
+      const { runFinancesTui } = await import('../src/finances-tui.js');
+      await runFinancesTui({
+        client,
+        baseUrl,
+        token: flags['no-stream'] ? null : token,
+        days,
+        interval: Number.isFinite(parsedInterval) ? parsedInterval : 30,
+        businessId: flags['business-id'],
+        theme: flags.theme,
+      });
+      return;
+    }
+
+    case 'summary': {
+      const { client } = financesClient();
+      const snapshot = await fin.collectFinanceSnapshot(client, { days, businessId: flags['business-id'] });
+      if (flags.json) { print.json(snapshot); return; }
+      const fmt = await import('../src/finances-tui.js');
+      printFinanceSummary(snapshot, fmt);
+      return;
+    }
+
+    case 'position':
+    case 'debt':
+    case 'income': {
+      // Reads the summary route alone: everything on this screen comes from
+      // there, so there is no reason to fan out to eleven sources for it.
+      const { client } = financesClient();
+      const summary = await fin.getFinanceSummary(client, { days, includeHidden: Boolean(flags.hidden) });
+      const position = summary?.position;
+      if (!position) {
+        print.error('This CoinPay server does not report a debt-and-income position yet.');
+        process.exit(1);
+      }
+      if (flags.json) { print.json(position); return; }
+      const fmt = await import('../src/finances-tui.js');
+      console.log('');
+      printPosition(position, fmt, { heading: true, detail: true });
+      return;
+    }
+
+    case 'accounts': {
+      const { client } = financesClient();
+      const accounts = await fin.listFinanceAccounts(client, { includeHidden: Boolean(flags.hidden) });
+      if (flags.json) { print.json({ accounts }); return; }
+      if (!accounts.length) { print.info('No linked accounts. Connect a bank at ' + new URL('/finances', getBaseUrl()).toString()); return; }
+      const { money, shortDate } = await import('../src/finances-tui.js');
+      console.log('');
+      printTable(accounts, [
+        { title: 'Institution', render: (a) => a.org_name || '—' },
+        { title: 'Account', render: (a) => a.name },
+        { title: 'Kind', render: (a) => a.effective_kind || a.kind },
+        { title: 'Balance', align: 'right', render: (a) => money(a.display_balance ?? a.balance ?? 0, a.currency || 'USD') },
+        { title: 'Available', align: 'right', render: (a) => (a.available_balance == null ? '—' : money(a.available_balance, a.currency || 'USD')) },
+        { title: 'As of', render: (a) => shortDate(a.balance_date) },
+        { title: 'Id', render: (a) => a.id },
+      ]);
+      console.log('');
+      return;
+    }
+
+    case 'ledger':
+    case 'transactions': {
+      const { client } = financesClient();
+      const parsedLimit = Number.parseInt(String(flags.limit ?? ''), 10);
+      const page = await fin.listFinanceTransactions(client, {
+        limit: Number.isFinite(parsedLimit) ? parsedLimit : 50,
+        offset: Number.parseInt(String(flags.offset ?? '0'), 10) || 0,
+        search: flags.search,
+        category: flags.category,
+        accountId: flags.account,
+        startDate: flags.start || flags.since,
+        endDate: flags.end || flags.until,
+        includePending: !flags['no-pending'],
+      });
+      if (flags.json) { print.json(page); return; }
+      if (!page.rows?.length) { print.info('No transactions match.'); return; }
+      const { money, shortDate } = await import('../src/finances-tui.js');
+      console.log('');
+      printTable(page.rows, [
+        { title: 'Date', render: (r) => shortDate(r.transacted_at || r.posted) },
+        { title: 'Account', render: (r) => `${r.org_name ? r.org_name.split(' ')[0] + ' ' : ''}${r.account_name}` },
+        { title: 'Payee / description', render: (r) => (r.payee || r.description || r.memo || '—').slice(0, 40) },
+        { title: 'Category', render: (r) => r.category || '—' },
+        { title: 'Amount', align: 'right', render: (r) => money(r.amount, r.currency || 'USD') },
+        { title: '', render: (r) => (r.pending ? 'pending' : '') },
+      ]);
+      console.log(`\n${page.rows.length} of ${page.total}` + (page.total > page.offset + page.rows.length ? `  (--offset ${page.offset + page.rows.length} for more)` : ''));
+      console.log('');
+      return;
+    }
+
+    case 'connections': {
+      const { client } = financesClient();
+      const data = await fin.listFinanceConnections(client);
+      if (flags.json) { print.json(data); return; }
+      const list = data.connections || [];
+      if (!list.length) {
+        print.info('No bank connections. Link one at ' + new URL('/finances', getBaseUrl()).toString() + (data.plaidEnabled ? ' (Plaid or SimpleFIN)' : ' (SimpleFIN)'));
+        return;
+      }
+      const { ago } = await import('../src/finances-tui.js');
+      console.log('');
+      for (const c of list) {
+        console.log(`${colors.bright}${c.label || c.id}${colors.reset}  ${colors.cyan}${c.provider}${colors.reset}  ${c.is_active ? colors.green + 'active' : colors.yellow + 'inactive'}${colors.reset}`);
+        console.log(`  id          ${c.id}`);
+        console.log(`  last sync   ${ago(c.last_synced_at)} · ${c.last_sync_status || '—'} · ${c.last_sync_accounts ?? 0} accounts / ${c.last_sync_transactions ?? 0} transactions`);
+        if (c.last_sync_error) console.log(`  ${colors.yellow}note${colors.reset}        ${c.last_sync_error}`);
+      }
+      console.log('');
+      return;
+    }
+
+    case 'sync': {
+      const { client } = financesClient();
+      print.info('Pulling fresh balances and transactions from the bank bridge…');
+      const parsedSyncDays = Number.parseInt(String(flags.days ?? ''), 10);
+      const result = await fin.syncFinances(client, {
+        days: Number.isFinite(parsedSyncDays) ? parsedSyncDays : undefined,
+        connectionId: flags.connection || flags['connection-id'],
+      });
+      if (flags.json) { print.json(result); return; }
+      const t = result.totals || {};
+      print.success(`Synced ${t.accounts ?? 0} accounts: ${t.transactionsNew ?? 0} new of ${t.transactionsSeen ?? 0} transactions (${result.status}).`);
+      for (const r of result.results || []) {
+        if (r.status === 'partial' || r.error) print.warn(`${r.connectionId || r.id || 'connection'}: ${r.error || r.status}`);
+      }
+      return;
+    }
+
+    default:
+      print.error(`Unknown finances command: ${subcommand}`);
+      console.log('Usage: coinpay finances [tui|summary|accounts|ledger|connections|sync]');
+      process.exit(1);
+  }
+}
+
 async function main() {
   const { command, subcommand, args, flags } = parseArgs(process.argv.slice(2));
   validateBooleanFlags(flags);
@@ -4064,6 +4418,17 @@ async function handleLightning(subcommand, args, flags) {
 
       case 'oauth':
         await handleOAuth(subcommand, args, flags);
+        break;
+
+      case 'finances':
+      case 'finance':
+      case 'money':
+        await handleFinances(subcommand, args, flags);
+        break;
+
+      case 'tui':
+      case 'dashboard':
+        await handleFinances('tui', [subcommand, ...args].filter(Boolean), flags);
         break;
 
       case 'update':

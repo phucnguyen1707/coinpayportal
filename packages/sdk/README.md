@@ -690,6 +690,59 @@ coinpay webhook logs biz_123
 coinpay webhook test biz_123 --event payment.completed
 ```
 
+### Finances — your money in one place
+
+```bash
+coinpay finances                 # live dashboard (needs `coinpay login`)
+coinpay finances --days 90       # window for earnings / cashflow: 7, 30, 90, 365
+coinpay finances summary         # plain text, --json for machines
+coinpay finances position        # debt vs income, credits vs debits (also: debt)
+coinpay finances accounts        # linked bank & credit-card accounts (SimpleFIN / Plaid)
+coinpay finances ledger --search anthropic --limit 20
+coinpay finances connections     # institutions and their last sync
+coinpay finances sync            # pull fresh balances (rate-limited by the bank bridge)
+```
+
+The dashboard has seven screens (`1`–`7`, `Tab`): **Overview** (gross volume, crypto vs
+cards, commission paid, processor fees, refunds, net earnings, bank position, cashflow,
+invoices, escrow, payouts, a volume-vs-commission graph and a live feed), **Bank &
+Cards**, **Ledger**, **Crypto**, **Cards**, **Invoices & Escrow**, **Debt & Income**.
+`r` refreshes, `s`
+syncs the bank feed, `w` cycles the window, `p` pauses, `?` shows help, `q` quits. It
+refreshes every 30 seconds (`--interval`) and listens to the payments event stream, so
+a crypto payment shows up the moment it is detected.
+
+**Debt & Income** is the basic-accounting view, and it reads the same for a company or
+a person: income against spending per month, total owed split into revolving and
+instalment, months to clear each balance at its current payment rate, debt-to-income,
+debt-service ratio, months of cover, card utilisation, the recurring bills it found with
+their next due date, and a business-versus-personal split of all of it.
+
+Two things about those numbers. Transfers and card payments are excluded from both
+income and spending — a feed holding both a checking account and the card it pays
+contains every card payment twice, so counting raw credits as income inflates both
+sides by the whole card-payment volume. The untouched totals stay on screen as gross
+credits and gross debits, so the netting is auditable. And the figures come from about
+six months of history rather than the dashboard window (`w` does not move them), because
+a monthly charge cannot be seen in thirty days of rows; the per-month averages divide by
+the history that actually exists, which for a recently linked feed is much less than six
+months.
+
+It is built on [@profullstack/hqtui](https://hqtui.com) and needs Node 22.6+; the
+plain-text subcommands work on Node 20. Bank data needs the merchant session from
+`coinpay login` (business API keys are refused on purpose).
+
+From the SDK:
+
+```js
+import { CoinPayClient } from '@profullstack/coinpay';
+import { collectFinanceSnapshot } from '@profullstack/coinpay/finances';
+
+const client = new CoinPayClient({ apiKey: sessionToken });
+const snapshot = await collectFinanceSnapshot(client, { days: 30 });
+console.log(snapshot.earnings.netUsd, snapshot.bank.liabilities, snapshot.invoices.totals.overdue);
+```
+
 ---
 
 ## Webhook Integration
