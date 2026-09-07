@@ -699,14 +699,19 @@ export async function processPayment(supabase: any, payment: Payment): Promise<{
   // Check if we have a payment address
   if (!payment.payment_address) {
     if (isExpired) {
-      console.log(`[Monitor] Payment ${payment.id} expired`);
-      await supabase
+      const { data, error } = await supabase
         .from('payments')
         .update({
           status: 'expired',
           updated_at: now.toISOString(),
         })
-        .eq('id', payment.id);
+        .eq('id', payment.id)
+        .eq('status', 'pending')
+        .select('id')
+        .maybeSingle();
+      if (error) throw error;
+      if (!data) return { confirmed: false, expired: false };
+      console.log(`[Monitor] Payment ${payment.id} expired`);
       return { confirmed: false, expired: true };
     }
 
@@ -720,8 +725,6 @@ export async function processPayment(supabase: any, payment: Payment): Promise<{
   
   // Settlement requires the full amount — see lib/payments/tolerance.ts.
   if (isSufficientPayment(balanceResult.balance, payment.crypto_amount)) {
-    console.log(`[Monitor] Payment ${payment.id} CONFIRMED with balance ${balanceResult.balance}`);
-    
     // Mark as confirmed and store tx_hash if available
     const updateData: Record<string, any> = {
       status: 'confirmed',
@@ -733,10 +736,17 @@ export async function processPayment(supabase: any, payment: Payment): Promise<{
       updateData.tx_hash = balanceResult.txHash;
     }
     
-    await supabase
+    // The balance read may outlive another worker's settlement of this payment.
+    const { data, error } = await supabase
       .from('payments')
       .update(updateData)
-      .eq('id', payment.id);
+      .eq('id', payment.id)
+      .eq('status', 'pending')
+      .select('id')
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return { confirmed: false, expired: false };
+    console.log(`[Monitor] Payment ${payment.id} CONFIRMED with balance ${balanceResult.balance}`);
     
     // Trigger forwarding
     const appUrl = process.env.NEXT_PUBLIC_APP_URL || process.env.APP_URL || 'http://localhost:3000';
@@ -790,14 +800,19 @@ export async function processPayment(supabase: any, payment: Payment): Promise<{
       return { confirmed: false, expired: false };
     }
 
-    console.log(`[Monitor] Payment ${payment.id} expired`);
-    await supabase
+    const { data, error } = await supabase
       .from('payments')
       .update({
         status: 'expired',
         updated_at: now.toISOString(),
       })
-      .eq('id', payment.id);
+      .eq('id', payment.id)
+      .eq('status', 'pending')
+      .select('id')
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return { confirmed: false, expired: false };
+    console.log(`[Monitor] Payment ${payment.id} expired`);
     return { confirmed: false, expired: true };
   }
   
