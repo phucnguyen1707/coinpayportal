@@ -12,6 +12,7 @@
     "start": "next start -p 8080",
     "lint": "eslint src/",
     "test": "vitest run",
+    "test:invoice-creation-db": "node --test scripts/invoice-creation.postgres.test.mjs",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
     "playwright:install": "playwright install",
