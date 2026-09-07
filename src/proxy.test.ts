@@ -18,15 +18,15 @@ function post(
 }
 
 /** How many requests land before the limiter starts answering 429. */
-function countUntilLimited(
+async function countUntilLimited(
   path: string,
   ip: string,
   attempts: number,
   headers: Record<string, string> = {}
-): number {
+): Promise<number> {
   let allowed = 0;
   for (let i = 0; i < attempts; i++) {
-    const response = proxy(post(path, ip, headers));
+    const response = await proxy(post(path, ip, headers));
     if (response.status === 429) break;
     allowed++;
   }
@@ -75,16 +75,16 @@ describe('presentedCredential', () => {
 });
 
 describe('proxy rate limiting', () => {
-  it('caps an anonymous API caller at the general limit', () => {
-    const allowed = countUntilLimited('/api/rates', '10.1.0.1', 80);
+  it('caps an anonymous API caller at the general limit', async () => {
+    const allowed = await countUntilLimited('/api/rates', '10.1.0.1', 80);
     expect(allowed).toBe(60);
   });
 
   // The regression that broke bulk invoice payments: ugig.net mints one payment
   // request per accepted invoice from a single server IP, so an 80-invoice queue
   // burst past 60/min and the rest came back "Too many requests" during prepare.
-  it('lets a credentialed integration burst well past the anonymous limit', () => {
-    const allowed = countUntilLimited('/api/payments/create', '10.1.0.2', 200, {
+  it('lets a credentialed integration burst well past the anonymous limit', async () => {
+    const allowed = await countUntilLimited('/api/payments/create', '10.1.0.2', 200, {
       authorization: 'Bearer sk_live_ugig',
     });
     expect(allowed).toBe(200);
@@ -92,39 +92,42 @@ describe('proxy rate limiting', () => {
 
   // The extension uses the `Wallet` scheme; a batch spends two API calls per
   // payment, so treating it as anonymous capped a payout at ~30 payments.
-  it('gives the wallet extension the credentialed budget', () => {
-    const allowed = countUntilLimited('/api/web-wallet/w1/broadcast', '10.1.0.6', 200, {
+  it('gives the wallet extension the credentialed budget', async () => {
+    const allowed = await countUntilLimited('/api/web-wallet/w1/broadcast', '10.1.0.6', 200, {
       authorization: 'Wallet wid-1:sig-abc:1234567890',
     });
     expect(allowed).toBe(200);
   });
 
-  it('budgets each API key separately from the same host', () => {
+  it('budgets each API key separately from the same host', async () => {
     const headersA = { authorization: 'Bearer sk_live_a' };
     const headersB = { authorization: 'Bearer sk_live_b' };
     // Spend key A's whole budget.
-    countUntilLimited('/api/payments/create', '10.1.0.3', 700, headersA);
+    expect(await countUntilLimited('/api/payments/create', '10.1.0.3', 700, headersA)).toBe(600);
     // Key B is untouched.
-    const response = proxy(post('/api/payments/create', '10.1.0.3', headersB));
-    expect(response.status).not.toBe(429);
+    const response = await proxy(post('/api/payments/create', '10.1.0.3', headersB));
+    expect(response.status).toBe(200);
   });
 
-  it('still bounds a host that rotates keys', () => {
+  it('still bounds a host that rotates keys', async () => {
     const ip = '10.1.0.4';
     let limited = false;
+    let allowed = 0;
     for (let i = 0; i < 1400 && !limited; i++) {
-      const response = proxy(
+      const response = await proxy(
         post('/api/payments/create', ip, { authorization: `Bearer sk_rotate_${i}` })
       );
       if (response.status === 429) limited = true;
+      else allowed++;
     }
     expect(limited).toBe(true);
+    expect(allowed).toBe(1200);
   });
 
   // Without this, brute-forcing a login is a matter of bolting on an unverified
   // Authorization header to buy a 600/min budget.
-  it('keeps auth endpoints IP-limited even when a credential is presented', () => {
-    const allowed = countUntilLimited('/api/auth/login', '10.1.0.5', 40, {
+  it('keeps auth endpoints IP-limited even when a credential is presented', async () => {
+    const allowed = await countUntilLimited('/api/auth/login', '10.1.0.5', 40, {
       authorization: 'Bearer sk_live_anything',
     });
     expect(allowed).toBe(10);

@@ -6,6 +6,9 @@ import { resolveMerchant } from '@/lib/auth/merchant';
 import { authorizeBusiness, listAccessibleBusinessIds } from '@/lib/auth/authz';
 import { resolvePayee } from '@/lib/payments/payee';
 import { insertWithInvoiceNumber } from '@/lib/invoices/numbering';
+import {
+  creationIdentity, findCreatedInvoice, createInvoiceOnce, InvoiceCreationError,
+} from '@/lib/invoices/creation';
 
 /**
  * GET /api/invoices
@@ -98,6 +101,10 @@ export async function POST(request: NextRequest) {
     const { merchantId, apiKeyBusinessId } = authResult;
 
     const body = await request.json();
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return NextResponse.json({ success: false, error: 'Expected an invoice object' }, { status: 400 });
+    }
+    const identity = creationIdentity(request.headers.get('Idempotency-Key'), body);
     const {
       business_id, client_id, currency, amount, crypto_currency,
       due_date, notes, wallet_id, merchant_wallet_address,
@@ -156,6 +163,13 @@ export async function POST(request: NextRequest) {
           },
           { status: 403 }
         );
+      }
+    }
+
+    if (identity.key && identity.hash) {
+      const previous = await findCreatedInvoice(supabase, resolvedBusinessId, identity.key, identity.hash);
+      if (previous) {
+        return NextResponse.json({ success: true, invoice: previous, idempotentReplay: true });
       }
     }
 
@@ -238,6 +252,34 @@ export async function POST(request: NextRequest) {
     const isPaidTier = await isBusinessPaidTier(supabase, resolvedBusinessId);
     const feeRate = getFeePercentage(isPaidTier);
 
+    const invoiceFields = {
+      user_id: invoiceOwnerId,
+      business_id: resolvedBusinessId,
+      client_id: client_id || null,
+      status: 'draft',
+      currency: currency || 'USD',
+      amount,
+      crypto_currency: crypto_currency || null,
+      merchant_wallet_address: payeeAddress,
+      wallet_id: wallet_id || null,
+      fee_rate: feeRate,
+      due_date: due_date || null,
+      notes: notes || null,
+      metadata: {
+        ...(payeeSource ? { payee_source: payeeSource } : {}),
+        ...(identity.source ? { source_reference: identity.source } : {}),
+      },
+    };
+    if (identity.key && identity.hash) {
+      const created = await createInvoiceOnce(
+        supabase, resolvedBusinessId, identity.key, identity.hash, invoiceFields, schedule, identity.sourceRateLimit,
+      );
+      return NextResponse.json(
+        { success: true, invoice: created.invoice, idempotentReplay: created.replayed },
+        { status: created.replayed ? 200 : 201 },
+      );
+    }
+
     // Numbering and the 23505 retry both live in the shared helper now. This
     // route already had them right; the other three sites did not, and keeping
     // four copies is how they diverged in the first place.
@@ -247,20 +289,8 @@ export async function POST(request: NextRequest) {
       (invoiceNumber) => supabase
         .from('invoices')
         .insert({
-          user_id: invoiceOwnerId,
-          business_id: resolvedBusinessId,
-          client_id: client_id || null,
+          ...invoiceFields,
           invoice_number: invoiceNumber,
-          status: 'draft',
-          currency: currency || 'USD',
-          amount,
-          crypto_currency: crypto_currency || null,
-          merchant_wallet_address: payeeAddress,
-          wallet_id: wallet_id || null,
-          fee_rate: feeRate,
-          due_date: due_date || null,
-          notes: notes || null,
-          metadata: payeeSource ? { payee_source: payeeSource } : {},
         })
         .select(`
           *,
@@ -302,6 +332,14 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({ success: true, invoice }, { status: 201 });
   } catch (error) {
+    if (error instanceof InvoiceCreationError) {
+      return NextResponse.json(
+        { success: false, error: error.message, code: error.code }, { status: error.status },
+      );
+    }
+    if (error instanceof SyntaxError) {
+      return NextResponse.json({ success: false, error: 'Invalid JSON' }, { status: 400 });
+    }
     console.error('Create invoice error:', error);
     return NextResponse.json({ success: false, error: 'Internal server error' }, { status: 500 });
   }
