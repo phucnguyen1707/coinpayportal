@@ -23,6 +23,7 @@ type ActivatableInvoice = {
   business_id: string;
   user_id: string;
   metadata?: Record<string, unknown> | null;
+  updated_at: string | null;
   businesses?: { merchant_id?: string | null } | null;
 };
 
@@ -41,15 +42,19 @@ export type ActivateInvoiceResult =
     };
 
 function activationKey(invoice: ActivatableInvoice): string {
+  const revision = invoice.metadata?.invoice_edit_revision;
+  const suffix = typeof revision === 'string' && /^[a-f\d-]{36}$/i.test(revision)
+    ? `:edit:${revision}` : '';
   if (invoice.status === 'overdue') {
     const previousPaymentId =
       typeof invoice.metadata?.coinpay_payment_id === 'string'
         ? invoice.metadata.coinpay_payment_id
         : 'legacy';
-    return `invoice:${invoice.id}:renew:${previousPaymentId}`;
+    return `invoice:${invoice.id}:renew:${previousPaymentId}${suffix}`;
   }
 
-  return `invoice:${invoice.id}:initial`;
+  // Preserve pre-existing keys for untouched drafts and partial legacy attempts.
+  return `invoice:${invoice.id}:initial${suffix}`;
 }
 
 function invoicePaymentWindow(invoice: ActivatableInvoice): number {
@@ -203,7 +208,7 @@ export async function activateInvoicePayment(
   }
 
   const now = new Date().toISOString();
-  const { data: updatedInvoice, error: updateError } = await supabase
+  let update = supabase
     .from('invoices')
     .update({
       status: 'sent',
@@ -228,7 +233,14 @@ export async function activateInvoicePayment(
       updated_at: now,
     })
     .eq('id', invoice.id)
-    .eq('status', invoice.status)
+    .eq('status', invoice.status);
+  // Match the snapshot used for provider creation. Metadata equality also
+  // fences draft edits that happen within the same timestamp millisecond.
+  update = invoice.updated_at == null
+    ? update.is('updated_at', null) : update.eq('updated_at', invoice.updated_at);
+  update = invoice.metadata == null
+    ? update.is('metadata', null) : update.eq('metadata', JSON.stringify(invoice.metadata));
+  const { data: updatedInvoice, error: updateError } = await update
     .select('*, clients (id, name, email, company_name), businesses (id, name, merchant_id)')
     .maybeSingle();
 
@@ -248,7 +260,8 @@ export async function activateInvoicePayment(
       .eq('id', invoice.id)
       .single();
 
-    if (!reloadError && current?.status === 'sent' && current.payment_address) {
+    if (!reloadError && current?.status === 'sent' && current.payment_address
+      && current.metadata?.payment_activation_key === key) {
       return {
         ok: true,
         invoice: current,

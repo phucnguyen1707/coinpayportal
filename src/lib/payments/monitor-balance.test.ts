@@ -170,7 +170,12 @@ describe('processPayment expiry', () => {
       from: () => ({
         update: (values: Record<string, unknown>) => {
           updates.push(values);
-          return { eq: async () => ({ error: null }) };
+          const query = {
+            eq: () => query,
+            select: () => query,
+            maybeSingle: async () => ({ data: { id: 'pay-1' }, error: null }),
+          };
+          return query;
         },
       }),
     };
@@ -251,7 +256,12 @@ describe('SOL settlement requires a funding transaction', () => {
       from: () => ({
         update: (values: Record<string, unknown>) => {
           updates.push(values);
-          return { eq: async () => ({ error: null }) };
+          const query = {
+            eq: () => query,
+            select: () => query,
+            maybeSingle: async () => ({ data: { id: 'pay-290' }, error: null }),
+          };
+          return query;
         },
       }),
     };
@@ -377,5 +387,114 @@ describe('SOL settlement requires a funding transaction', () => {
 
     expect(result.balance).toBe(0);
     expect(result.error).toMatch(/no funding transaction/);
+  });
+});
+
+describe('processPayment transition ownership', () => {
+  const mockFetch = vi.fn();
+  const forwardUrl = 'http://monitor.example/api/payments/pay-cas/forward';
+  const payment = {
+    id: 'pay-cas',
+    business_id: 'business-cas',
+    blockchain: 'ETH',
+    crypto_amount: 1,
+    payment_address: '0x1111111111111111111111111111111111111111',
+    merchant_wallet_address: '0x2222222222222222222222222222222222222222',
+    created_at: '2026-01-01T00:00:00Z',
+    expires_at: '2020-01-01T00:00:00Z',
+  };
+  const paths = [
+    { name: 'expiry without an address', address: '', balance: '0x0', status: 'expired' },
+    { name: 'expiry after an unpaid balance', address: payment.payment_address, balance: '0x0', status: 'expired' },
+    { name: 'confirmation', address: payment.payment_address, balance: '0xde0b6b3a7640000', status: 'confirmed' },
+  ];
+
+  function makeSupabase(data: { id: string } | null, error: { message: string } | null = null) {
+    const query = {
+      eq: vi.fn().mockReturnThis(),
+      select: vi.fn().mockReturnThis(),
+      maybeSingle: vi.fn().mockResolvedValue({ data, error }),
+    };
+    const update = vi.fn().mockReturnValue(query);
+    const client = { from: vi.fn().mockReturnValue({ update }) };
+    return { client, query, update };
+  }
+
+  function mockChain(balance: string) {
+    mockFetch.mockImplementation(async (url: string) => {
+      if (url === forwardUrl) return jsonOk({ success: true });
+      return jsonOk({ result: balance });
+    });
+  }
+
+  beforeEach(() => {
+    mockFetch.mockReset();
+    vi.stubGlobal('fetch', mockFetch);
+    vi.stubEnv('INTERNAL_API_KEY', 'synthetic-monitor-test-key');
+    vi.stubEnv('NEXT_PUBLIC_APP_URL', 'http://monitor.example');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it.each(paths)('does not report or forward a lost CAS for $name', async ({ address, balance }) => {
+    mockChain(balance);
+    const { client, query } = makeSupabase(null);
+
+    const result = await processPayment(client, { ...payment, payment_address: address } as never);
+
+    expect(result).toEqual({ confirmed: false, expired: false });
+    expect(query.eq.mock.calls).toEqual([['id', payment.id], ['status', 'pending']]);
+    expect(query.select).toHaveBeenCalledWith('id');
+    expect(query.maybeSingle).toHaveBeenCalledOnce();
+    expect(mockFetch.mock.calls.filter(([url]) => url === forwardUrl)).toHaveLength(0);
+  });
+
+  it.each(paths)('surfaces a database error without forwarding for $name', async ({ address, balance }) => {
+    mockChain(balance);
+    const { client } = makeSupabase(null, { message: 'synthetic database write failure' });
+
+    await expect(processPayment(client, { ...payment, payment_address: address } as never))
+      .rejects.toThrow('synthetic database write failure');
+    expect(mockFetch.mock.calls.filter(([url]) => url === forwardUrl)).toHaveLength(0);
+  });
+
+  it.each(paths.slice(0, 2))('reports a winning CAS for $name', async ({ address, balance }) => {
+    mockChain(balance);
+    const { client, query, update } = makeSupabase({ id: payment.id });
+
+    const result = await processPayment(client, { ...payment, payment_address: address } as never);
+
+    expect(result).toEqual({ confirmed: false, expired: true });
+    expect(update).toHaveBeenCalledWith(expect.objectContaining({ status: 'expired' }));
+    expect(query.eq.mock.calls).toEqual([['id', payment.id], ['status', 'pending']]);
+    expect(query.maybeSingle).toHaveBeenCalledOnce();
+    expect(mockFetch.mock.calls.filter(([url]) => url === forwardUrl)).toHaveLength(0);
+  });
+
+  it('forwards exactly once when one confirmation wins and a stale snapshot loses', async () => {
+    mockChain('0xde0b6b3a7640000');
+    const { client, query } = makeSupabase(null);
+    query.maybeSingle.mockResolvedValueOnce({ data: { id: payment.id }, error: null });
+
+    expect(await processPayment(client, payment as never)).toEqual({ confirmed: true, expired: false });
+    expect(await processPayment(client, payment as never)).toEqual({ confirmed: false, expired: false });
+
+    expect(query.maybeSingle).toHaveBeenCalledTimes(2);
+    expect(query.eq.mock.calls).toEqual([
+      ['id', payment.id], ['status', 'pending'],
+      ['id', payment.id], ['status', 'pending'],
+    ]);
+    const forwards = mockFetch.mock.calls.filter(([url]) => url === forwardUrl);
+    expect(forwards).toHaveLength(1);
+    expect(forwards[0][1]).toMatchObject({
+      method: 'POST', headers: { Authorization: 'Bearer synthetic-monitor-test-key' },
+    });
   });
 });

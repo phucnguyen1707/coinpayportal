@@ -40,6 +40,7 @@ const invoice = {
   business_id: 'biz-1',
   user_id: 'merchant-1',
   metadata: {},
+  updated_at: '2026-09-07T00:00:00.000Z',
   businesses: { merchant_id: 'merchant-1' },
 };
 
@@ -52,6 +53,7 @@ function invoiceClient(
 ) {
   const updateQuery: any = {};
   updateQuery.eq = vi.fn(() => updateQuery);
+  updateQuery.is = vi.fn(() => updateQuery);
   updateQuery.select = vi.fn(() => updateQuery);
   updateQuery.maybeSingle = vi.fn().mockResolvedValue({
     data:
@@ -140,6 +142,8 @@ describe('activateInvoicePayment', () => {
       })
     );
     expect(updateQuery.eq).toHaveBeenCalledWith('status', 'draft');
+    expect(updateQuery.eq).toHaveBeenCalledWith('updated_at', invoice.updated_at);
+    expect(updateQuery.eq).toHaveBeenCalledWith('metadata', '{}');
   });
 
   it('does not mutate the invoice while a winning request is still allocating its address', async () => {
@@ -230,7 +234,8 @@ describe('activateInvoicePayment', () => {
   });
 
   it('returns the invoice activated by a concurrent winner after the CAS misses', async () => {
-    const winner = { ...invoice, status: 'sent', payment_address: 'winner-address' };
+    const winner = { ...invoice, status: 'sent', payment_address: 'winner-address',
+      metadata: { payment_activation_key: 'invoice:inv-1:initial' } };
     const { supabase } = invoiceClient({ updateData: null, reloaded: winner });
 
     const result = await activateInvoicePayment(supabase, invoice);
@@ -240,5 +245,42 @@ describe('activateInvoicePayment', () => {
       invoice: { status: 'sent', payment_address: 'winner-address' },
       idempotentReplay: true,
     });
+  });
+
+  it.each(['draft', 'overdue'])('uses a stable new key for an edited %s invoice', async (status) => {
+    const revision = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const edited = { ...invoice, status, metadata: { invoice_edit_revision: revision, coinpay_payment_id: 'previous-payment' } };
+    const { supabase } = invoiceClient();
+    await activateInvoicePayment(supabase, edited);
+    await activateInvoicePayment(supabase, edited);
+    const base = status === 'draft' ? 'initial' : 'renew:previous-payment';
+    const key = `invoice:inv-1:${base}:edit:${revision}`;
+    expect(vi.mocked(createPayment).mock.calls.map((call) => call[1].idempotency_key)).toEqual([key, key]);
+    expect(createInvoiceStripeCheckout).toHaveBeenCalledWith(supabase, edited, false, `${key}:stripe`);
+  });
+
+  it('retains the unedited overdue renewal key', async () => {
+    const { supabase } = invoiceClient();
+    await activateInvoicePayment(supabase, { ...invoice, status: 'overdue', metadata: { coinpay_payment_id: 'previous-payment' } });
+    expect(createPayment).toHaveBeenCalledWith(supabase, expect.objectContaining({ idempotency_key: 'invoice:inv-1:renew:previous-payment' }));
+  });
+
+  it('does not call a different revision concurrent winner a successful replay', async () => {
+    const { supabase } = invoiceClient({ updateData: null, reloaded: { ...invoice,
+      status: 'sent', payment_address: 'different-payment', metadata: { payment_activation_key: 'different-key' } } });
+    expect(await activateInvoicePayment(supabase, invoice)).toMatchObject({ ok: false, status: 409, code: 'INVOICE_STATE_CHANGED' });
+  });
+
+  it('fails closed when an edit wins the guarded update', async () => {
+    const { supabase, updateQuery } = invoiceClient({ updateData: null, reloaded: { ...invoice, amount: 41 } });
+    expect(await activateInvoicePayment(supabase, invoice)).toMatchObject({ ok: false, status: 409, code: 'INVOICE_STATE_CHANGED' });
+    expect(updateQuery.eq).toHaveBeenCalledWith('metadata', '{}');
+  });
+
+  it('uses SQL NULL comparisons for legacy nullable revision fields', async () => {
+    const { supabase, updateQuery } = invoiceClient();
+    await activateInvoicePayment(supabase, { ...invoice, metadata: null, updated_at: null });
+    expect(updateQuery.is).toHaveBeenCalledWith('updated_at', null);
+    expect(updateQuery.is).toHaveBeenCalledWith('metadata', null);
   });
 });
