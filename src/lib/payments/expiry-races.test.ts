@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { webcrypto } from 'node:crypto';
+import { randomUUID, webcrypto } from 'node:crypto';
 import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
 import type { NextRequest } from 'next/server';
@@ -86,6 +86,8 @@ async function callRoute() {
 // Execute the actual edge entrypoint with its Deno/server and Supabase transport
 // supplied locally. This is handler coverage, not a Deno deployment/runtime test.
 function edgeHandler(client: SupabaseClient, rpcBalance?: string) {
+  const cronSecret = randomUUID();
+  const serviceToken = randomUUID();
   let handler: ((request: Request) => Promise<Response>) | undefined;
   const source = readFileSync(new URL('../../../supabase/functions/monitor-payments/index.ts', import.meta.url), 'utf8');
   const code = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
@@ -104,12 +106,12 @@ function edgeHandler(client: SupabaseClient, rpcBalance?: string) {
       return Response.json({ result: rpcBalance });
     }),
     Deno: {
-      env: { get: (key: string) => ({ CRON_SECRET: 'synthetic-secret', SUPABASE_SERVICE_ROLE_KEY: 'synthetic-service', SUPABASE_URL: 'http://localhost' } as Record<string, string>)[key] },
+      env: { get: (key: string) => ({ CRON_SECRET: cronSecret, SUPABASE_SERVICE_ROLE_KEY: serviceToken, SUPABASE_URL: 'http://localhost' } as Record<string, string>)[key] },
       serve: (callback: typeof handler) => { handler = callback; },
     },
   });
   if (!handler) throw new Error('Edge handler not registered');
-  return () => handler!(new Request('http://localhost/monitor', { method: 'POST', headers: { Authorization: 'Bearer synthetic-secret' } }));
+  return () => handler!(new Request('http://localhost/monitor', { method: 'POST', headers: { Authorization: `Bearer ${cronSecret}` } }));
 }
 
 beforeEach(() => {
