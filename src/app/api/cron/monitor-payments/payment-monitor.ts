@@ -15,6 +15,22 @@ import { isSufficientPayment } from '@/lib/payments/tolerance';
 
 const MAX_FORWARD_RETRY_ATTEMPTS = 5;
 
+async function expirePendingPayment(
+  supabase: SupabaseClient,
+  table: 'payments' | 'business_collection_payments',
+  paymentId: string,
+  now: Date,
+): Promise<boolean> {
+  const { data, error } = await supabase
+    .from(table)
+    .update({ status: 'expired', updated_at: now.toISOString() })
+    .eq('id', paymentId)
+    .eq('status', 'pending')
+    .select('id');
+  if (error) throw error;
+  return Boolean(data?.length);
+}
+
 function getNextRetryAt(attempts: number): string {
   const baseSeconds = 60; // 1m
   const delaySeconds = Math.min(baseSeconds * Math.pow(2, Math.max(0, attempts - 1)), 60 * 60); // cap at 1h
@@ -142,8 +158,8 @@ export async function confirmAndForwardPayment(
   payment: Payment,
   balance: number,
   now: Date,
-): Promise<void> {
-  const { data: claimed } = await supabase
+): Promise<boolean> {
+  const { data: claimed, error: claimError } = await supabase
     .from('payments')
     .update({
       status: 'confirmed',
@@ -153,10 +169,11 @@ export async function confirmAndForwardPayment(
     .eq('id', payment.id)
     .eq('status', payment.status)
     .select('id');
+  if (claimError) throw claimError;
 
   if (!claimed || claimed.length === 0) {
     console.log(`Payment ${payment.id} was claimed by another worker; skipping duplicate forward`);
-    return;
+    return false;
   }
 
   await sendWebhook(supabase, { ...payment, status: 'confirmed' } as Payment, 'payment.confirmed', {
@@ -175,10 +192,11 @@ export async function confirmAndForwardPayment(
 
   if (addrCheck?.is_escrow) {
     console.log(`Payment ${payment.id} is escrow-held — skipping auto-forward`);
-    return;
+    return true;
   }
 
   await triggerForwarding(supabase, payment.id);
+  return true;
 }
 
 /**
@@ -288,8 +306,9 @@ export async function rescanLateDeposits(
       console.log(
         `Payment ${payment.id} is stuck in '${payment.status}' with ${balance} ${payment.blockchain} still at ${payment.payment_address}; re-driving it`,
       );
-      await confirmAndForwardPayment(supabase, payment as Payment, balance, now);
-      stats.confirmed++;
+      if (await confirmAndForwardPayment(supabase, payment as Payment, balance, now)) {
+        stats.confirmed++;
+      }
     } catch (err) {
       console.error(`Error rescanning stuck payment ${payment.id}:`, err);
       stats.errors++;
@@ -341,13 +360,7 @@ export async function monitorPayments(
       // while funds are already sitting at the generated CoinPay address.
       if (!payment.payment_address) {
         if (isExpired) {
-          await supabase
-            .from('payments')
-            .update({
-              status: 'expired',
-              updated_at: now.toISOString(),
-            })
-            .eq('id', payment.id);
+          if (!(await expirePendingPayment(supabase, 'payments', payment.id, now))) continue;
 
           await sendWebhook(supabase, { ...payment, status: 'expired' } as Payment, 'payment.expired', {
             reason: 'Payment window expired (15 minutes)',
@@ -370,16 +383,11 @@ export async function monitorPayments(
         if (isExpired) {
           console.log(`Payment ${payment.id} was funded near the end of its window; processing instead of expiring`);
         }
-        await confirmAndForwardPayment(supabase, payment as Payment, balance, now);
-        stats.confirmed++;
+        if (await confirmAndForwardPayment(supabase, payment as Payment, balance, now)) {
+          stats.confirmed++;
+        }
       } else if (isExpired) {
-        await supabase
-          .from('payments')
-          .update({
-            status: 'expired',
-            updated_at: now.toISOString(),
-          })
-          .eq('id', payment.id);
+        if (!(await expirePendingPayment(supabase, 'payments', payment.id, now))) continue;
 
         await sendWebhook(supabase, { ...payment, status: 'expired' } as Payment, 'payment.expired', {
           reason: 'Payment window expired (15 minutes)',
@@ -417,10 +425,7 @@ export async function monitorPayments(
 
         if (!payment.payment_address) {
           if (isExpired) {
-            await supabase
-              .from('business_collection_payments')
-              .update({ status: 'expired', updated_at: now.toISOString() })
-              .eq('id', payment.id);
+            await expirePendingPayment(supabase, 'business_collection_payments', payment.id, now);
           }
           continue;
         }
@@ -438,10 +443,7 @@ export async function monitorPayments(
             );
           }
           if (isExpired) {
-            await supabase
-              .from('business_collection_payments')
-              .update({ status: 'expired', updated_at: now.toISOString() })
-              .eq('id', payment.id);
+            await expirePendingPayment(supabase, 'business_collection_payments', payment.id, now);
           }
           continue;
         }
@@ -451,12 +453,13 @@ export async function monitorPayments(
         }
 
         // CAS so two schedulers cannot both confirm and both activate the plan.
-        const { data: claimedCollection } = await supabase
+        const { data: claimedCollection, error: claimError } = await supabase
           .from('business_collection_payments')
           .update({ status: 'confirmed', confirmed_at: now.toISOString(), updated_at: now.toISOString() })
           .eq('id', payment.id)
           .eq('status', 'pending')
           .select('id');
+        if (claimError) throw claimError;
 
         if (!claimedCollection || claimedCollection.length === 0) {
           continue;

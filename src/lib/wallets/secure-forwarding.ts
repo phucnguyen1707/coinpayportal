@@ -598,7 +598,7 @@ export async function forwardPaymentSecurely(
     // The expected amount stays as a floor sanity check: a balance that has
     // dropped below it means funds already left, and forwarding must not
     // proceed on a stale view.
-    let potToSplit = payment.crypto_amount;
+    let potToSplit: number;
     try {
       const actualBalance = await checkAddressBalance(
         addressData.address,
@@ -665,12 +665,24 @@ export async function forwardPaymentSecurely(
 
         potToSplit = actualBalance;
       } else {
-        console.warn(
-          `[SECURE] Could not read balance for ${paymentId}; splitting the expected amount instead`
-        );
+        throw new Error('Balance lookup returned an invalid value');
       }
     } catch (balanceError) {
       console.warn(`[SECURE] Balance read failed for ${paymentId}:`, balanceError);
+      // Nothing has been broadcast. Release only our forwarding claim so a
+      // later worker can retry once the balance provider recovers.
+      const { error: releaseError } = await supabase
+        .from('payments')
+        .update({ status: 'confirmed', updated_at: new Date().toISOString() })
+        .eq('id', paymentId)
+        .eq('status', 'forwarding');
+      if (releaseError) {
+        console.error(`[SECURE] Could not release forwarding claim for ${paymentId}:`, releaseError);
+      }
+      return {
+        success: false,
+        error: 'Unable to verify address balance - forwarding deferred',
+      };
     }
 
     const split = splitTieredPayment(potToSplit - gasReserve, isPaidTier);

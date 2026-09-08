@@ -542,13 +542,17 @@ Deno.serve(async (req) => {
         const expiresAt = new Date(payment.expires_at);
         if (now > expiresAt) {
           // Mark as expired/cancelled
-          await supabase
+          const { data: expired, error: expireError } = await supabase
             .from('payments')
             .update({
               status: 'expired',
               updated_at: now.toISOString(),
             })
-            .eq('id', payment.id);
+            .eq('id', payment.id)
+            .eq('status', 'pending')
+            .select('id');
+          if (expireError) throw expireError;
+          if (!expired?.length) continue;
           
           // Send webhook notification
           await sendWebhook(supabase, { ...payment, status: 'expired' }, 'payment.expired', {
@@ -586,7 +590,7 @@ Deno.serve(async (req) => {
           // Compare-and-swap: this function, the in-process monitor, the HTTP
           // cron and the merchant-facing balance check all race here. Without
           // the status guard each of them forwards the same payment on-chain.
-          const { data: claimed } = await supabase
+          const { data: claimed, error: claimError } = await supabase
             .from('payments')
             .update({
               status: 'confirmed',
@@ -595,6 +599,7 @@ Deno.serve(async (req) => {
             .eq('id', payment.id)
             .eq('status', 'pending')
             .select('id');
+          if (claimError) throw claimError;
 
           if (!claimed || claimed.length === 0) {
             console.log(`Payment ${payment.id} already claimed by another worker; skipping`);

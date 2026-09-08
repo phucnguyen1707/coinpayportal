@@ -145,6 +145,34 @@ const SOLANA_TOKENS = {
 // API keys
 const CRYPTO_APIS_KEY = process.env.CRYPTO_APIS_KEY || '';
 
+// A failed lookup is not an empty wallet. Callers must defer expiry/forwarding
+// when these checks throw, rather than making a financial decision using zero.
+function nonnegativeNumber(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new Error('Invalid balance response');
+  }
+  return value;
+}
+
+function integerNumber(value: unknown): number {
+  const number = nonnegativeNumber(value);
+  if (!Number.isSafeInteger(number)) throw new Error('Invalid integer balance response');
+  return number;
+}
+
+function decimalString(value: unknown, integer = false): number {
+  const pattern = integer ? /^\d+$/ : /^\d+(?:\.\d+)?$/;
+  if (typeof value !== 'string' || !pattern.test(value)) throw new Error('Invalid balance response');
+  return nonnegativeNumber(Number(value));
+}
+
+function hexBalance(value: unknown, decimals: number): number {
+  if (typeof value !== 'string' || !/^0x[0-9a-fA-F]{1,64}$/.test(value)) {
+    throw new Error('Invalid RPC balance response');
+  }
+  return nonnegativeNumber(Number(BigInt(value)) / 10 ** decimals);
+}
+
 /**
  * Check balance for a Bitcoin address using Blockstream API
  */
@@ -153,15 +181,15 @@ export async function checkBitcoinBalance(address: string): Promise<number> {
     const response = await fetchWithTimeout(`https://blockstream.info/api/address/${address}`);
     if (!response.ok) {
       console.error(`Failed to fetch BTC balance for ${address}: ${response.status}`);
-      return 0;
+      throw new Error('BTC balance lookup failed');
     }
     
     const data = await response.json();
-    const balanceSatoshis = (data.chain_stats?.funded_txo_sum || 0) - (data.chain_stats?.spent_txo_sum || 0);
-    return balanceSatoshis / 100_000_000;
+    const balanceSatoshis = integerNumber(data?.chain_stats?.funded_txo_sum) - integerNumber(data?.chain_stats?.spent_txo_sum);
+    return nonnegativeNumber(balanceSatoshis) / 100_000_000;
   } catch (error) {
     console.error(`Error checking BTC balance for ${address}:`, error);
-    return 0;
+    throw new Error('Unable to determine BTC balance', { cause: error });
   }
 }
 
@@ -205,7 +233,7 @@ export async function checkBCHBalance(address: string): Promise<number> {
         
         if (response.ok) {
           const data = await response.json();
-          const confirmedBalance = parseFloat(data.data?.item?.confirmedBalance?.amount || '0');
+          const confirmedBalance = decimalString(data?.data?.item?.confirmedBalance?.amount);
           console.log(`[Monitor BCH] CryptoAPIs balance: ${confirmedBalance} BCH`);
           return confirmedBalance;
         } else {
@@ -229,7 +257,7 @@ export async function checkBCHBalance(address: string): Promise<number> {
         const haskoinData = await haskoinResponse.json();
         if (typeof haskoinData?.confirmed === 'number') {
           console.log(`[Monitor BCH] Haskoin balance: ${haskoinData.confirmed} sat`);
-          return haskoinData.confirmed / 100_000_000;
+          return integerNumber(haskoinData.confirmed) / 100_000_000;
         }
       }
     } catch (haskoinError) {
@@ -243,7 +271,7 @@ export async function checkBCHBalance(address: string): Promise<number> {
       
       if (blockchairResponse.ok) {
         const blockchairData = await blockchairResponse.json();
-        const balanceSatoshis = blockchairData?.data?.[legacyAddress]?.address?.balance || 0;
+        const balanceSatoshis = integerNumber(blockchairData?.data?.[legacyAddress]?.address?.balance);
         return balanceSatoshis / 100_000_000;
       }
     } catch (blockchairError) {
@@ -251,10 +279,10 @@ export async function checkBCHBalance(address: string): Promise<number> {
     }
     
     console.error(`[Monitor BCH] All APIs failed for ${address}`);
-    return 0;
+    throw new Error('All BCH balance sources failed');
   } catch (error) {
     console.error(`[Monitor BCH] Error checking balance for ${address}:`, error);
-    return 0;
+    throw new Error('Unable to determine BCH balance', { cause: error });
   }
 }
 
@@ -276,20 +304,19 @@ export async function checkEVMBalance(address: string, rpcUrl: string): Promise<
     
     if (!response.ok) {
       console.error(`Failed to fetch EVM balance for ${address}: ${response.status}`);
-      return 0;
+      throw new Error('EVM balance lookup failed');
     }
     
     const data = await response.json();
     if (data.error) {
       console.error(`RPC error for ${address}:`, data.error);
-      return 0;
+      throw new Error('EVM RPC balance lookup failed');
     }
     
-    const balanceWei = BigInt(data.result || '0x0');
-    return Number(balanceWei) / 1e18;
+    return hexBalance(data?.result, 18);
   } catch (error) {
     console.error(`Error checking EVM balance for ${address}:`, error);
-    return 0;
+    throw new Error('Unable to determine EVM balance', { cause: error });
   }
 }
 
@@ -319,20 +346,19 @@ export async function checkEVMTokenBalance(
 
     if (!response.ok) {
       console.error(`Failed to fetch EVM token balance for ${address}: ${response.status}`);
-      return 0;
+      throw new Error('EVM token balance lookup failed');
     }
 
     const data = await response.json();
     if (data.error) {
       console.error(`RPC error for token balance ${address}:`, data.error);
-      return 0;
+      throw new Error('EVM token RPC balance lookup failed');
     }
 
-    const balanceRaw = BigInt(data.result || '0x0');
-    return Number(balanceRaw) / 10 ** decimals;
+    return hexBalance(data?.result, decimals);
   } catch (error) {
     console.error(`Error checking EVM token balance for ${address}:`, error);
-    return 0;
+    throw new Error('Unable to determine EVM token balance', { cause: error });
   }
 }
 
@@ -357,7 +383,7 @@ export async function checkSolanaBalance(address: string, rpcUrl: string): Promi
     if (!response.ok) {
       const errorText = await response.text();
       console.error(`Failed to fetch Solana balance for ${address}: ${response.status} - ${errorText}`);
-      return 0;
+      throw new Error('SOL balance lookup failed');
     }
     
     const data = await response.json();
@@ -365,16 +391,16 @@ export async function checkSolanaBalance(address: string, rpcUrl: string): Promi
     
     if (data.error) {
       console.error(`RPC error for ${address}:`, data.error);
-      return 0;
+      throw new Error('SOL RPC balance lookup failed');
     }
     
-    const balanceLamports = data.result?.value || 0;
+    const balanceLamports = integerNumber(data?.result?.value);
     const balanceSOL = balanceLamports / 1e9;
     console.log(`Solana balance for ${address}: ${balanceLamports} lamports = ${balanceSOL} SOL`);
     return balanceSOL;
   } catch (error) {
     console.error(`Error checking Solana balance for ${address}:`, error);
-    return 0;
+    throw new Error('Unable to determine SOL balance', { cause: error });
   }
 }
 
@@ -406,35 +432,29 @@ export async function checkSolanaTokenBalance(
     if (!response.ok) {
       const errorText = await response.text();
       console.error(`Failed to fetch Solana token balance for ${address}: ${response.status} - ${errorText}`);
-      return 0;
+      throw new Error('SPL token balance lookup failed');
     }
 
     const data = await response.json();
     if (data.error) {
       console.error(`RPC error for Solana token balance ${address}:`, data.error);
-      return 0;
+      throw new Error('SPL token RPC balance lookup failed');
     }
 
-    const accounts = data.result?.value || [];
+    const accounts = data?.result?.value;
+    if (!Array.isArray(accounts)) throw new Error('Invalid token account response');
     let totalBalance = 0;
 
     for (const account of accounts) {
       const tokenAmount = account?.account?.data?.parsed?.info?.tokenAmount;
-      if (typeof tokenAmount?.uiAmount === 'number') {
-        totalBalance += tokenAmount.uiAmount;
-        continue;
-      }
-
-      const rawAmount = tokenAmount?.amount;
-      if (typeof rawAmount === 'string') {
-        totalBalance += Number(rawAmount) / 10 ** decimals;
-      }
+      if (tokenAmount?.decimals !== decimals) throw new Error('Unexpected token decimals');
+      totalBalance += decimalString(tokenAmount?.amount, true) / 10 ** decimals;
     }
 
-    return totalBalance;
+    return nonnegativeNumber(totalBalance);
   } catch (error) {
     console.error(`Error checking Solana token balance for ${address}:`, error);
-    return 0;
+    throw new Error('Unable to determine SPL token balance', { cause: error });
   }
 }
 
@@ -454,25 +474,25 @@ export async function checkXRPBalance(address: string, rpcUrl: string): Promise<
 
     if (!response.ok) {
       console.error(`Failed to fetch XRP balance for ${address}: ${response.status}`);
-      return 0;
+      throw new Error('XRP balance lookup failed');
     }
 
     const data = await response.json();
 
-    if (data.result?.error === 'actNotFound') {
+    if (!data.error && data.result?.error === 'actNotFound') {
       return 0;
     }
 
-    if (data.result?.error) {
-      console.error(`XRP RPC error for ${address}:`, data.result.error);
-      return 0;
+    if (data.error || data.result?.error) {
+      console.error(`XRP RPC error for ${address}:`, data.error ?? data.result?.error);
+      throw new Error('XRP RPC balance lookup failed');
     }
 
-    const balanceDrops = parseInt(data.result?.account_data?.Balance || '0', 10);
+    const balanceDrops = decimalString(data?.result?.account_data?.Balance, true);
     return balanceDrops / 1_000_000;
   } catch (error) {
     console.error(`Error checking XRP balance for ${address}:`, error);
-    return 0;
+    throw new Error('Unable to determine XRP balance', { cause: error });
   }
 }
 
@@ -484,7 +504,7 @@ export async function checkADABalance(address: string, rpcUrl: string): Promise<
     const apiKey = process.env.BLOCKFROST_API_KEY;
     if (!apiKey) {
       console.error('[ADA] BLOCKFROST_API_KEY not configured');
-      return 0;
+      throw new Error('ADA balance provider is not configured');
     }
 
     const response = await fetchWithTimeout(`${rpcUrl}/addresses/${address}`, {
@@ -492,22 +512,19 @@ export async function checkADABalance(address: string, rpcUrl: string): Promise<
       headers: { 'project_id': apiKey },
     });
 
-    if (response.status === 404) {
-      return 0;
-    }
-
     if (!response.ok) {
       console.error(`Failed to fetch ADA balance for ${address}: ${response.status}`);
-      return 0;
+      throw new Error('ADA balance lookup failed');
     }
 
     const data = await response.json();
-    const lovelaceEntry = (data.amount || []).find((a: { unit: string; quantity: string }) => a.unit === 'lovelace');
-    const lovelace = parseInt(lovelaceEntry?.quantity || '0', 10);
+    if (!Array.isArray(data?.amount)) throw new Error('Invalid ADA balance response');
+    const lovelaceEntry = data.amount.find((a: { unit: string; quantity: string }) => a?.unit === 'lovelace');
+    const lovelace = decimalString(lovelaceEntry?.quantity, true);
     return lovelace / 1_000_000;
   } catch (error) {
     console.error(`Error checking ADA balance for ${address}:`, error);
-    return 0;
+    throw new Error('Unable to determine ADA balance', { cause: error });
   }
 }
 
@@ -531,10 +548,14 @@ export async function checkADABalance(address: string, rpcUrl: string): Promise<
  */
 async function checkDOGEBalance(address: string): Promise<number> {
   try {
-    const response = await fetchWithTimeout(`https://api.blockcypher.com/v1/doge/main/addrs/${address}/balance`);
-    if (response.ok) {
-      const data = await response.json();
-      return (data.balance || 0) / 1e8;
+    try {
+      const response = await fetchWithTimeout(`https://api.blockcypher.com/v1/doge/main/addrs/${address}/balance`);
+      if (response.ok) {
+        const data = await response.json();
+        return integerNumber(data?.balance) / 1e8;
+      }
+    } catch (primaryError) {
+      console.error('[Monitor DOGE] Primary balance source failed:', primaryError);
     }
 
     // dogechain.info served this fallback until it began returning 403 to
@@ -549,15 +570,15 @@ async function checkDOGEBalance(address: string): Promise<number> {
       if (fallbackResponse.ok) {
         const data = await fallbackResponse.json();
         // Tatum reports DOGE, not satoshis.
-        return parseFloat(data.balance || '0');
+        return decimalString(data?.balance);
       }
     }
 
     console.error(`[Monitor DOGE] Both balance sources failed for ${address}`);
-    return 0;
+    throw new Error('All DOGE balance sources failed');
   } catch (error) {
     console.error(`[Monitor DOGE] Error checking balance for ${address}:`, error);
-    return 0;
+    throw new Error('Unable to determine DOGE balance', { cause: error });
   }
 }
 
@@ -602,6 +623,6 @@ export async function checkBalance(address: string, blockchain: string): Promise
       return checkADABalance(address, RPC_ENDPOINTS.ADA);
     default:
       console.error(`Unsupported blockchain: ${blockchain}`);
-      return 0;
+      throw new Error(`Unsupported blockchain: ${blockchain}`);
   }
 }
