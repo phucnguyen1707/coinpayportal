@@ -180,6 +180,8 @@ describe('rescanLateDeposits', () => {
 
     // The CAS lost, so this worker must not send on-chain — otherwise three
     // schedulers plus the balance-check endpoint each pay the merchant.
+    expect(stats.confirmed).toBe(0);
+    expect(stats.errors).toBe(0);
     expect(fetch).not.toHaveBeenCalled();
     expect(sendWebhook).not.toHaveBeenCalled();
   });
